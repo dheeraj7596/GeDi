@@ -292,7 +292,9 @@ def main():
     in_df = pd.read_csv(args.test_file)
     prompts = list(in_df["prompts"])
     gen_seqs = []
-    for prompt in prompts:
+    for idx, prompt in enumerate(prompts):
+        if idx % 10 == 0:
+            print("Generating for prompt", idx, "out of", len(prompts), flush=True)
         text_ids = tokenizer.encode(prompt)
         encoded_prompts=torch.LongTensor(text_ids).unsqueeze(0).to(args.device)
         if args.gen_type=="gedi" and args.mode=="topic":
