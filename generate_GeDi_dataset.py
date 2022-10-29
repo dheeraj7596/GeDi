@@ -23,6 +23,9 @@ from transformers import (
     GPT2Tokenizer
 )
 
+from torch.utils.data import DataLoader
+import pandas as pd
+from datasets import load_dataset
 
 import os.path
 import time
@@ -99,7 +102,24 @@ def main():
         type=str,
         help="Where do you want to store the pre-trained models downloaded from s3",
     )
-
+    parser.add_argument(
+        "--test_file",
+        default="",
+        type=str,
+        help="test csv filepath",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="",
+        type=str,
+        help="output directory path",
+    )
+    parser.add_argument(
+        "--per_device_eval_batch_size",
+        default="",
+        type=int,
+        help="batch size",
+    )
     parser.add_argument(
         "--do_lower_case", action="store_true", help="Set this flag if you are using an uncased model.",
     )
@@ -276,109 +296,119 @@ def main():
     else:
         gedi_model=None
 
-    user_prompt = len(args.prompt)==0
-    while True:
+    data_files = {"test": args.test_file}
+    extension = args.test_file.split(".")[-1]
+    raw_datasets = load_dataset(extension, data_files=data_files)
+    text_column_name = raw_datasets["test"].column_names[0]
+    prompts = list(raw_datasets["test"][text_column_name])
 
-        if user_prompt:
-            if args.mode=="topic":
-                while True:
-                    code = input("Give a secondary code or hit enter to keep as "  + str(args.secondary_code) + ": ")
-                    if len(code)==0:
-                        break
-                    else:
-                        bpe_tokens = tokenizer.encode(code)
-                        if len(bpe_tokens)>1:
-                            print("Warning! number of bpe tokens for " + code + " is greater than 1, model isn't trained for this, generation is less likely to match topic.")
-                            args.secondary_code = code
-                        else:
-                            args.secondary_code = code
-                            break
-            if args.mode=="sentiment":
-                args.code_desired = "positive"
-                args.code_undesired = "negative"
-                yn = input("Generates positive by default. Press 'enter' to continue or 'n' to switch to negative (Warning, negative can lead to toxic generations at a higher rate than normal GPT-2 (or GPT-3)): " )
-                if yn == "n":
-                    args.code_desired = "negative"
-                    args.code_undesired = "positive"
+    tokenizer.pad_token = tokenizer.eos_token
+
+    def tokenize_function(examples):
+        res = tokenizer.encode_plus(examples[text_column_name],
+                        pad_to_max_length=True,
+                        max_length=200
+                        )
+        return res
+
+    lm_datasets = raw_datasets.map(
+        tokenize_function,
+        batched=True,
+        batch_size=args.per_device_eval_batch_size,
+        desc="Running tokenizer on dataset",
+    )
+
+    test_dataset = lm_datasets["test"]
+
+    test_dataloader = DataLoader(
+        test_dataset, batch_size=args.per_device_eval_batch_size
+    )
+
+    gen_seqs = []
+    batch_count = 0
+    for step, batch in enumerate(test_dataloader):
+        if batch_count % 10 == 0:
+            print("Batch finished", batch_count, "out of", int(len(test_dataset) / args.per_device_eval_batch_size),
+                  flush=True)
+        encoded_prompts = batch["input_ids"].to(args.device)
+        multi_code = None
+        attr_class = 1
+        with torch.no_grad():
+            output_sequences = model.generate(
+                input_ids=encoded_prompts,
+                pad_lens=None,
+                max_length=args.length,
+                temperature=args.temperature,
+                top_k=args.k,
+                top_p=args.p,
+                repetition_penalty=args.repetition_penalty,
+                rep_penalty_scale=args.rep_penalty_scale,
+                eos_token_ids=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                do_sample=args.do_sample,
+                penalize_cond=args.penalize_cond,
+                gedi_model=gedi_model,
+                gpt3_api_key=args.gpt3_api_key,
+                tokenizer=tokenizer,
+                disc_weight=args.disc_weight,
+                filter_p=args.filter_p,
+                target_p=args.target_p,
+                class_bias=args.class_bias,
+                attr_class=attr_class,
+                code_0=args.code_undesired,
+                code_1=args.code_desired,
+                multi_code=multi_code
+            )
+            outputs = [tokenizer.decode(x, skip_special_tokens=True, clean_up_tokenization_spaces=True) for x in
+                       output_sequences]
+            gen_seqs += outputs
+        batch_count += 1
+
+    df = pd.DataFrame({"prompts": prompts, "gen": gen_seqs})
+    # df_scores = compute_tox_scores(df)
+    df_scores = df
+
+    if args.output_dir is not None:
+        df_scores.to_csv(os.path.join(args.output_dir, "scores.csv"), index=False)
+
+    # text_ids = tokenizer.encode(args.prompt)
+    # encoded_prompts=torch.LongTensor(text_ids).unsqueeze(0).to(args.device)
+    #
+    # if args.gen_type=="gedi" and args.mode=="topic":
+    #     multi_code = tokenizer.encode(args.secondary_code)
+    #     attr_class = 1
+    # else:
+    #     multi_code = None
+    #     attr_class = 1
+
+    # generated_sequence = model.generate(
+    #     input_ids=encoded_prompts,
+    #     pad_lens=None,
+    #     max_length=args.length,
+    #     temperature=args.temperature,
+    #     top_k=args.k,
+    #     top_p=args.p,
+    #     repetition_penalty=args.repetition_penalty,
+    #     rep_penalty_scale=args.rep_penalty_scale,
+    #     eos_token_ids=tokenizer.eos_token_id,
+    #     pad_token_id=0,
+    #     do_sample=args.do_sample,
+    #     penalize_cond=args.penalize_cond,
+    #     gedi_model=gedi_model,
+    #     gpt3_api_key=args.gpt3_api_key,
+    #     tokenizer=tokenizer,
+    #     disc_weight=args.disc_weight,
+    #     filter_p=args.filter_p,
+    #     target_p=args.target_p,
+    #     class_bias=args.class_bias,
+    #     attr_class=attr_class,
+    #     code_0=args.code_undesired,
+    #     code_1=args.code_desired,
+    #     multi_code=multi_code
+    # )
 
 
-            while True:
-                args.prompt = input("Give a generation prompt (or type q to quit): ")
-                if len(args.prompt)>0:
-                    break
-            if args.prompt=="q":
-                break
-
-
-        if args.gen_type=="cclm":
-
-            prefix = tokenizer.encode(args.code_desired)[0]
-
-
-        start_len=0
-
-
-        text_ids = tokenizer.encode(args.prompt)
-        if args.gen_type == "cclm":
-
-            if args.mode=="topic":
-                text_ids=[prefix]+tokenizer.encode(args.secondary_code)+text_ids
-                start_len = len(tokenizer.decode([prefix]+tokenizer.encode(args.secondary_code)))
-            else:
-                text_ids=[prefix]+text_ids
-                start_len = len(tokenizer.decode([prefix]))
-
-
-
-        encoded_prompts=torch.LongTensor(text_ids).unsqueeze(0).to(args.device)
-
-
-        if args.gen_type=="gedi" and args.mode=="topic":
-            multi_code = tokenizer.encode(args.secondary_code)
-            attr_class = 1
-        else:
-            multi_code = None
-            attr_class = 1
-
-        generated_sequence = model.generate(
-            input_ids=encoded_prompts,
-                                         pad_lens=None,
-                                          max_length= args.length,
-                                          temperature=args.temperature,
-                                          top_k=args.k,
-                                          top_p=args.p,
-                                          repetition_penalty=args.repetition_penalty,
-                                          rep_penalty_scale=args.rep_penalty_scale,
-                                          eos_token_ids = tokenizer.eos_token_id,
-                                          pad_token_id = 0,
-                                          do_sample=args.do_sample,
-                                          penalize_cond=args.penalize_cond,
-                                          gedi_model=gedi_model,
-                                          gpt3_api_key = args.gpt3_api_key,
-                                          tokenizer=tokenizer,
-                                          disc_weight=args.disc_weight,
-                                          filter_p = args.filter_p,
-                                          target_p = args.target_p,
-                                          class_bias = args.class_bias,
-                                          attr_class = attr_class,
-                                          code_0 = args.code_undesired,
-                                          code_1 = args.code_desired,
-                                          multi_code=multi_code
-                                          )
-
-
-        text = tokenizer.decode(generated_sequence.tolist()[0], clean_up_tokenization_spaces=True)
-
-        if args.gen_type == "cclm":
-            text = text[start_len:]
-
-        print("\n")
-        print(text)
-        print("\n")
-
-        if not user_prompt:
-            break
-
+    # text = tokenizer.decode(generated_sequence.tolist()[0], clean_up_tokenization_spaces=True)
 
 
 
